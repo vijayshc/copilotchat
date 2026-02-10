@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Copilot CDP Chat</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f1a;
+      --panel: #121826;
+      --panel-2: #0f1522;
+      --border: #1f2a44;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+      --user: #2563eb;
+      --assistant: #1f2937;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+
+    .app {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      gap: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    header h1 {
+      font-size: 24px;
+      margin: 0;
+    }
+
+    .badge {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--panel-2);
+    }
+
+    .chat-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 520px;
+      overflow-y: auto;
+    }
+
+    .message {
+      max-width: 75%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+
+    .message.user {
+      margin-left: auto;
+      background: var(--user);
+      color: white;
+      border-top-right-radius: 4px;
+    }
+
+    .message.assistant {
+      margin-right: auto;
+      background: var(--assistant);
+      border-top-left-radius: 4px;
+    }
+
+    .message.system {
+      margin: 0 auto;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      padding: 0;
+    }
+
+    .composer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+    }
+
+    textarea {
+      flex: 1;
+      resize: none;
+      min-height: 48px;
+      max-height: 160px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    button {
+      border: none;
+      background: var(--accent);
+      color: #0b0f1a;
+      font-weight: 600;
+      padding: 10px 16px;
+      border-radius: 12px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 12px;
+      padding-left: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Copilot CDP Chat</h1>
+      <span class="badge">Streaming enabled</span>
+    </header>
+
+    <section id="chatPanel" class="chat-panel">
+      <div class="message system">Connected. Ask a question to begin.</div>
+    </section>
+
+    <div class="composer">
+      <textarea id="messageInput" placeholder="Type a message..." rows="2"></textarea>
+      <button id="sendBtn">Send</button>
+    </div>
+    <div id="status" class="status"></div>
+  </div>
+
+  <script>
+    const chatPanel = document.getElementById('chatPanel');
+    const input = document.getElementById('messageInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const status = document.getElementById('status');
+
+    let activeStream = null;
+
+    function appendMessage(text, role) {
+      const div = document.createElement('div');
+      div.className = `message ${role}`;
+      div.textContent = text;
+      chatPanel.appendChild(div);
+      chatPanel.scrollTop = chatPanel.scrollHeight;
+      return div;
+    }
+
+    function setStatus(text) {
+      status.textContent = text;
+    }
+
+    /**
+     * Progressive text revealer: animates new characters one-by-one
+     * into a target element.  When a new full-content snapshot arrives
+     * from SSE it is queued; if animation is mid-flight the queue
+     * ensures we never drop data and always converge to the latest
+     * full text.
+     */
+    function createRevealer(el, charDelayMs = 12) {
+      let fullTarget = '';   // the latest full text we need to reach
+      let revealed = 0;      // how many code units already visible
+      let rafId = null;
+      let lastTime = 0;
+
+      // Ensure pos never lands between a surrogate pair or inside a
+      // combining/ZWJ emoji sequence.  Advances past any trailing
+      // high surrogate so we never slice mid-character.
+      function safePos(pos) {
+        if (pos <= 0 || pos >= fullTarget.length) return pos;
+        const code = fullTarget.charCodeAt(pos - 1);
+        // If the last included code unit is a high surrogate (0xD800–0xDBFF),
+        // include its low-surrogate partner too.
+        if (code >= 0xD800 && code <= 0xDBFF) return Math.min(pos + 1, fullTarget.length);
+        return pos;
+      }
+
+      function tick(now) {
+        if (revealed >= fullTarget.length) {
+          rafId = null;
+          return;                     // nothing left to reveal
+        }
+        if (!lastTime) lastTime = now;
+        const elapsed = now - lastTime;
+
+        // reveal as many chars as the elapsed time allows
+        const charsToReveal = Math.max(1, Math.floor(elapsed / charDelayMs));
+        revealed = safePos(Math.min(revealed + charsToReveal, fullTarget.length));
+        el.textContent = fullTarget.slice(0, revealed);
+        chatPanel.scrollTop = chatPanel.scrollHeight;
+        lastTime = now;
+
+        rafId = requestAnimationFrame(tick);
+      }
+
+      return {
+        /** Push a new full-content snapshot (superset of previous). */
+        push(fullContent) {
+          fullTarget = fullContent;
+          // If new content is drastically ahead, fast-forward so we
+          // don't fall hopelessly behind (keep max 200 chars of runway).
+          const gap = fullTarget.length - revealed;
+          if (gap > 200) {
+            revealed = safePos(fullTarget.length - 200);
+            el.textContent = fullTarget.slice(0, revealed);
+          }
+          if (!rafId) {
+            lastTime = 0;
+            rafId = requestAnimationFrame(tick);
+          }
+        },
+        /** Instantly flush remaining text (call when stream ends). */
+        flush() {
+          if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+          revealed = fullTarget.length;
+          el.textContent = fullTarget;
+          chatPanel.scrollTop = chatPanel.scrollHeight;
+        }
+      };
+    }
+
+    async function sendMessage() {
+      const message = input.value.trim();
+      if (!message || activeStream) return;
+
+      appendMessage(message, 'user');
+      input.value = '';
+      input.style.height = 'auto';
+
+      const aiDiv = appendMessage('', 'assistant');
+      const revealer = createRevealer(aiDiv, 12);
+      setStatus('Streaming response...');
+      sendBtn.disabled = true;
+
+      try {
+        // Step 1: POST message via JSON body to get a stream_id
+        const initResp = await fetch('/send_stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        const initData = await initResp.json();
+        if (initData.error) {
+          setStatus('Error: ' + initData.error);
+          sendBtn.disabled = false;
+          return;
+        }
+
+        // Step 2: Connect EventSource (GET) for real-time SSE events
+        const source = new EventSource(`/stream_events/${initData.stream_id}`);
+        activeStream = source;
+
+        source.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload.content) {
+              revealer.push(payload.content);
+            }
+          } catch (e) {
+            console.error('Invalid SSE payload', e);
+          }
+        };
+
+        source.addEventListener('end', () => {
+          revealer.flush();
+          setStatus('Response complete.');
+          sendBtn.disabled = false;
+          activeStream = null;
+          source.close();
+        });
+
+        source.addEventListener('error', () => {
+          revealer.flush();
+          setStatus('Streaming error.');
+          sendBtn.disabled = false;
+          activeStream = null;
+          source.close();
+        });
+      } catch (e) {
+        console.error('Stream error', e);
+        setStatus('Streaming error.');
+        sendBtn.disabled = false;
+        activeStream = null;
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    input.addEventListener('input', () => {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    });
+  </script>
+</body>
+</html>

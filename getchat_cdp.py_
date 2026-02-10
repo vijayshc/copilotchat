@@ -1,0 +1,1148 @@
+#!/usr/bin/env python3
+"""
+Modified version to connect to existing browser in developer mode
+instead of launching a new browser instance.
+
+Instructions:
+1. Launch Chrome in developer mode first:
+   chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\temp\chrome-debug"
+
+2. Then run this script to connect to the existing browser
+"""
+
+import asyncio
+import time
+import json
+import datetime
+import logging
+import sys
+import signal
+import threading
+from pathlib import Path
+from typing import Set, Dict, Any, Optional
+
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+
+
+class CopilotChatCaptureCDP:
+    """Playwright-based capture for Copilot user and AI messages using CDP connection."""
+    
+    def __init__(self, 
+                 output_file: str = "copilot_chat_capture.txt",
+                 capture_interval: float = 0.5,
+                 cdp_endpoint: str = "http://172.27.240.1:9222",
+                 auto_select_copilot_tab: bool = True,
+                 auto_start_without_prompt: bool = True,
+                 self_test_enabled: bool = True,
+                 self_test_message: str = "Please reply with a short greeting for capture test.",
+                 self_test_timeout: float = 60.0,
+                 min_stable_seconds: float = 5.0):
+        """
+        Initialize the chat capture.
+        
+        Args:
+            output_file: Path to save captured messages
+            capture_interval: Seconds between capture checks
+            cdp_endpoint: Chrome DevTools Protocol endpoint
+        """
+        self.output_file = Path(output_file)
+        self.capture_interval = capture_interval
+        self.cdp_endpoint = cdp_endpoint
+        self.browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
+        self.running = False
+        self.auto_select_copilot_tab = auto_select_copilot_tab
+        self.auto_start_without_prompt = auto_start_without_prompt
+        self.self_test_enabled = self_test_enabled
+        self.self_test_message = self_test_message
+        self.self_test_timeout = self_test_timeout
+        self.min_stable_seconds = min_stable_seconds
+        self.user_messages_list = []  # Track all user messages by order
+        self.ai_messages_list = []    # Track all AI messages by order
+        self.last_user_index_written = -1    # Track last user message index written to file
+        self.last_ai_index_written = -1      # Track last AI message index written to file
+        self.ai_streaming_tracker = {}        # Track AI message lengths to detect streaming completion
+        self.streaming_wait_cycles = 8        # Number of cycles to wait for streaming to stabilize
+        self.message_count = 0
+        self.loop_count = 0
+        
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Create output directory
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Setup signal handlers (only in main thread)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        self.logger.info(f"Received signal {signum}, shutting down gracefully...")
+        self.running = False
+    
+    async def _connect_to_browser(self) -> tuple[Browser, Page]:
+        """Connect to existing browser via CDP."""
+        self.logger.info(f"Connecting to browser via CDP at {self.cdp_endpoint}...")
+        
+        try:
+            playwright = await async_playwright().start()
+            
+            # Connect to existing browser via CDP
+            browser = await playwright.chromium.connect_over_cdp(self.cdp_endpoint)
+            
+            # Get existing contexts and pages
+            contexts = browser.contexts
+            if not contexts:
+                self.logger.error("No browser contexts found. Make sure Chrome is running with a tab open.")
+                raise Exception("No browser contexts found")
+            
+            # Use the first context
+            context = contexts[0]
+            pages = context.pages
+            
+            if not pages:
+                self.logger.error("No pages found in browser context. Make sure you have a tab open.")
+                raise Exception("No pages found")
+            
+            # Use the first page, or create a new one
+            if len(pages) > 0:
+                page = pages[0]
+                self.logger.info(f"Using existing page: {page.url}")
+            else:
+                page = await context.new_page()
+                self.logger.info("Created new page")
+            
+            # Add page error handlers (suppress known benign Copilot UI errors)
+            def _handle_page_error(error):
+                message = str(error)
+                if "hasAttribute is not a function" in message:
+                    self.logger.debug(f"Suppressed page error: {message}")
+                    return
+                self.logger.error(f"Page error: {message}")
+
+            page.on("error", _handle_page_error)
+            page.on("pageerror", _handle_page_error)
+            
+            self.logger.info("✓ Successfully connected to browser via CDP")
+            return browser, page
+            
+        except Exception as e:
+            self.logger.error(f"Failed to connect to browser: {e}")
+            self.logger.info("\nTroubleshooting:")
+            self.logger.info("1. Make sure Chrome is running with: chrome.exe --remote-debugging-port=9222")
+            self.logger.info("2. Check if port 9222 is accessible")
+            self.logger.info("3. Ensure Chrome has at least one tab open")
+            raise
+    
+    async def _wait_for_user_ready(self):
+        """Wait for user to navigate to chat page if needed."""
+        if self.auto_select_copilot_tab:
+            await self._select_copilot_page(allow_open=True)
+
+        current_url = self.page.url
+        print("\n" + "="*60)
+        print("🌐 CONNECTED TO EXISTING BROWSER")
+        print("="*60)
+        print(f"Current page: {current_url}")
+        print("="*60)
+
+        if not self.auto_start_without_prompt:
+            print("\nInstructions:")
+            print("1. If not already there, navigate to Microsoft Copilot (https://copilot.microsoft.com)")
+            print("2. Login if needed")
+            print("3. Navigate to a chat conversation")
+            print("4. Make sure you can see chat messages")
+            print("5. Press ENTER here when ready to start capturing...")
+            print("="*60)
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, input)
+                print("✅ Starting message capture...")
+            except KeyboardInterrupt:
+                print("\n❌ Cancelled by user")
+                raise
+        else:
+            print("✅ Auto-start enabled: proceeding without prompt...")
+
+        await self._wait_for_chat_textbox()
+
+    async def _wait_for_chat_textbox(self, timeout_ms: int = 30000):
+        """Wait until the chat textbox is available."""
+        try:
+            await self.page.wait_for_selector('[role="textbox"], [contenteditable="true"], textarea, input', timeout=timeout_ms)
+            print("✅ Chat textbox detected")
+        except Exception as e:
+            self.logger.error(f"Chat textbox not found within timeout: {e}")
+            raise
+
+    async def _find_textbox(self):
+        """Find the most likely chat textbox element across frames."""
+        selectors = [
+            '[data-testid="chatQuestion"] [role="textbox"]',
+            '[data-testid="chatQuestion"] [contenteditable="true"]',
+            '[data-testid="chatQuestion"] textarea',
+            '[data-testid="chatQuestion"] input[type="text"]',
+            '[data-testid="bizchat-input-section"] [role="textbox"]',
+            '[data-testid="bizchat-input-section"] [contenteditable="true"]',
+            '[role="textbox"]',
+            '[contenteditable="true"]',
+            'textarea',
+            'input[type="text"]'
+        ]
+
+        frames = []
+        try:
+            frames = [self.page] + list(self.page.frames)
+        except Exception:
+            frames = [self.page]
+
+        for frame in frames:
+            for selector in selectors:
+                try:
+                    element = await frame.query_selector(selector)
+                    if element:
+                        return frame, element
+                except Exception:
+                    continue
+        return None, None
+
+    async def _set_textbox_value(self, textbox, message: str):
+        """Set textbox content and dispatch input events."""
+        try:
+            await textbox.evaluate(
+                """(el, value) => {
+                    const isEditable = el.isContentEditable;
+                    if (isEditable) {
+                        el.focus();
+                        el.textContent = value;
+                    } else if ('value' in el) {
+                        el.focus();
+                        el.value = value;
+                    }
+                    const ev = new Event('input', { bubbles: true });
+                    el.dispatchEvent(ev);
+                    const ev2 = new Event('change', { bubbles: true });
+                    el.dispatchEvent(ev2);
+                }""",
+                message
+            )
+        except Exception:
+            pass
+
+    async def _is_send_button_present(self) -> bool:
+        """Check if the send button is present (used to infer completion)."""
+        selectors = [
+            '[data-testid="fai-SendButton"]',
+            '[data-testid="fai-send-button"]',
+            'button[aria-label="Send"]',
+            'button[type="submit"]'
+        ]
+        for selector in selectors:
+            try:
+                element = await self.page.query_selector(selector)
+                if element:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _get_loading_message_text(self) -> str:
+        """Get the latest loading (streaming) message text, if present."""
+        try:
+            elements = await self.page.query_selector_all('[data-testid="loading-message"]')
+            if not elements:
+                return ""
+            # Use the last loading element in DOM order
+            text = await elements[-1].inner_text()
+            return text.strip() if text else ""
+        except Exception:
+            return ""
+
+    async def _is_loading_message_present(self) -> bool:
+        """Check if a loading (streaming) message element is present."""
+        try:
+            element = await self.page.query_selector('[data-testid="loading-message"]')
+            return element is not None
+        except Exception:
+            return False
+
+    def _normalize_stream_text(self, text: str) -> str:
+        """Normalize streaming text to reduce repeated headers/noise."""
+        if not text:
+            return ""
+
+        lines = [line.rstrip() for line in text.splitlines()]
+        skip_prefixes = (
+            "Copilot",
+            "Generating response",
+            "Reasoned for",
+            "Get a quick answer",
+            "You said:",
+            "Today",
+        )
+
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                cleaned.append("")
+                continue
+            if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+                continue
+            if stripped == ":":
+                continue
+            cleaned.append(line)
+
+        return "\n".join(cleaned).strip()
+
+    async def _select_copilot_page(self, allow_open: bool = True):
+        """Select an existing Copilot chat tab or open one if needed."""
+        try:
+            selected_page = None
+            best_score = -1
+            for context in self.browser.contexts:
+                for page in context.pages:
+                    page_url = page.url or ""
+                    if page_url.startswith("devtools://"):
+                        continue
+
+                    score = 0
+                    if "m365.cloud.microsoft/chat" in page_url:
+                        score += 7
+                    if "m365.cloud.microsoft.com/chat" in page_url:
+                        score += 6
+                    if "/chat" in page_url or "/chats" in page_url:
+                        score += 4
+                    if "copilot.microsoft.com" in page_url or "m365.cloud.microsoft.com" in page_url:
+                        score += 2
+
+                    try:
+                        textbox = await page.query_selector('[role="textbox"]')
+                        if textbox:
+                            score += 5
+                    except Exception:
+                        pass
+
+                    if score > best_score:
+                        best_score = score
+                        selected_page = page
+
+            if selected_page and best_score > 0:
+                self.page = selected_page
+                self.logger.info(f"Selected existing Copilot page: {self.page.url}")
+            elif allow_open:
+                self.logger.info("No suitable Copilot chat page found; opening new tab...")
+                await self._open_copilot_page()
+
+        except Exception as e:
+            self.logger.error(f"Failed to select Copilot page: {e}")
+            raise
+
+    async def _open_copilot_page(self):
+        """Open a new tab to Copilot and set it as the active page."""
+        context = self.browser.contexts[0]
+        self.page = await context.new_page()
+        await self.page.goto("https://m365.cloud.microsoft/chat/?fromcode=cmmyr718qsb&refOrigin=Google&auth=2", wait_until="domcontentloaded")
+        self.logger.info(f"Opened Copilot page: {self.page.url}")
+
+    async def _send_message(self, message: str):
+        """Send a message via the chat textbox."""
+        try:
+            # Wait for textbox to be visible and ready (important for ongoing chats)
+            await self.page.wait_for_selector(
+                '[role="textbox"], [contenteditable="true"], textarea, input',
+                state="visible",
+                timeout=10000
+            )
+            await asyncio.sleep(1)
+
+            last_error = None
+            for attempt in range(3):
+                frame, textbox = await self._find_textbox()
+                if not textbox:
+                    last_error = "Chat textbox not found"
+                    await asyncio.sleep(1)
+                    continue
+
+                await textbox.click()
+                await asyncio.sleep(0.2)
+
+                # Clear existing content using keyboard shortcuts (works for contenteditable divs)
+                await self.page.keyboard.press("Control+A")
+                await self.page.keyboard.press("Backspace")
+
+                # Ensure contenteditable gets cleared even if keyboard shortcuts are ignored
+                try:
+                    await textbox.evaluate("""el => {
+                        if (el.isContentEditable) {
+                            el.textContent = '';
+                        } else if ('value' in el) {
+                            el.value = '';
+                        }
+                    }""")
+                except Exception:
+                    pass
+
+                # Try DOM set with input events first
+                await self._set_textbox_value(textbox, message)
+                await asyncio.sleep(0.2)
+
+                # Fallback to keyboard typing if needed
+                try:
+                    await self.page.keyboard.type(message)
+                except Exception:
+                    pass
+
+                # Verify message landed in textbox before sending
+                try:
+                    current_value = await textbox.evaluate("""el => {
+                        if (el.isContentEditable) return el.textContent || '';
+                        if ('value' in el) return el.value || '';
+                        return '';
+                    }""")
+                except Exception:
+                    current_value = ""
+
+                if message[:10] in (current_value or ""):
+                    self.logger.info(f"Message set in textbox at {datetime.datetime.now().isoformat()}")
+                    await self.page.keyboard.press("Enter")
+                    self.logger.info(f"Message sent at {datetime.datetime.now().isoformat()}")
+                    print(f"📨 Sent message: {message}")
+                    return
+
+                last_error = "Message not set in textbox"
+                await asyncio.sleep(1)
+
+            raise Exception(last_error or "Failed to send message")
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {e}")
+            raise
+
+    async def _run_self_test(self):
+        """Run an end-to-end self test by sending a message and capturing replies."""
+        print("\n🧪 Running end-to-end capture test...")
+        start_user_count = len(self.user_messages_list)
+        start_ai_count = len(self.ai_messages_list)
+
+        await self._send_message(self.self_test_message)
+
+        test_start = time.time()
+        user_captured = False
+        ai_captured = False
+
+        while time.time() - test_start < self.self_test_timeout:
+            await asyncio.sleep(self.capture_interval)
+            await self._capture_messages()
+
+            if len(self.user_messages_list) > start_user_count:
+                user_captured = True
+            if len(self.ai_messages_list) > start_ai_count:
+                ai_captured = True
+
+            if user_captured and ai_captured:
+                print("✅ Self-test complete: user + AI messages captured")
+                return True
+
+        print("❌ Self-test timed out: did not capture expected messages")
+        return False
+
+    async def send_message_and_wait_for_ai(self, message: str, timeout: float = 60.0) -> str:
+        """Send a user message and wait for the next AI response to complete."""
+        if not self.browser or not self.page:
+            self.browser, self.page = await self._connect_to_browser()
+
+        if self.auto_select_copilot_tab:
+            await self._select_copilot_page(allow_open=True)
+
+        await self._wait_for_chat_textbox()
+
+        # Snapshot current counts
+        current_user_messages = await self._get_current_user_messages()
+        current_ai_messages = await self._get_current_ai_messages()
+        start_user_count = len(current_user_messages)
+        start_ai_count = len(current_ai_messages)
+        baseline_last_ai = current_ai_messages[-1]['content'] if current_ai_messages else ""
+        baseline_loading = await self._get_loading_message_text()
+
+        await self._send_message(message)
+        send_time = time.time()
+        self.logger.info(f"Send timestamp: {datetime.datetime.now().isoformat()}")
+
+        start_time = time.time()
+        last_change_time = start_time
+        last_content = self._normalize_stream_text(baseline_last_ai)
+        stable_cycles = 0
+        first_token_logged = False
+        while time.time() - start_time < timeout:
+            await asyncio.sleep(self.capture_interval)
+
+            current_user_messages = await self._get_current_user_messages()
+            current_ai_messages = await self._get_current_ai_messages()
+
+            # Update internal lists for consistency
+            if len(current_user_messages) > len(self.user_messages_list):
+                new_user_messages = current_user_messages[len(self.user_messages_list):]
+                self.user_messages_list.extend(new_user_messages)
+                for i, message_data in enumerate(new_user_messages):
+                    message_index = len(self.user_messages_list) - len(new_user_messages) + i
+                    await self._save_message_by_index("user", message_index, message_data)
+                    self.last_user_index_written = message_index
+
+            loading_text = await self._get_loading_message_text()
+            latest = loading_text or (current_ai_messages[-1]['content'] if current_ai_messages else "")
+            latest = self._normalize_stream_text(latest)
+
+            if not latest:
+                continue
+
+            if loading_text:
+                if loading_text == baseline_loading:
+                    continue
+            else:
+                if len(current_ai_messages) == start_ai_count and latest == baseline_last_ai:
+                    continue
+
+            if len(current_ai_messages) >= start_ai_count or loading_text:
+                if latest != last_content:
+                    if not first_token_logged:
+                        first_token_logged = True
+                        self.logger.info(
+                            f"First token received at {datetime.datetime.now().isoformat()} "
+                            f"(latency {time.time() - send_time:.3f}s)"
+                        )
+                    self.logger.info(
+                        f"Delta at {datetime.datetime.now().isoformat()} (len {len(latest)})"
+                    )
+                    last_content = latest
+                    last_change_time = time.time()
+                    stable_cycles = 0
+                else:
+                    stable_cycles += 1
+
+                time_since_change = time.time() - last_change_time
+                loading_present = await self._is_loading_message_present()
+                send_button_present = await self._is_send_button_present()
+                if stable_cycles >= self.streaming_wait_cycles and time_since_change >= self.min_stable_seconds and (not loading_present or send_button_present):
+                    if current_ai_messages:
+                        last_index = len(current_ai_messages) - 1
+                        message_data = current_ai_messages[last_index]
+                        self.ai_messages_list = current_ai_messages
+                        await self._save_message_by_index("ai", last_index, message_data)
+                        self.last_ai_index_written = last_index
+                        return message_data['content']
+                    return latest
+
+        raise TimeoutError("Timed out waiting for AI response")
+
+    async def stream_ai_response(self, message: str, timeout: float = 60.0):
+        """Send a user message and stream AI response deltas as they arrive."""
+        if not self.browser or not self.page:
+            self.browser, self.page = await self._connect_to_browser()
+
+        if self.auto_select_copilot_tab:
+            await self._select_copilot_page(allow_open=True)
+
+        await self._wait_for_chat_textbox()
+
+        current_ai_messages = await self._get_current_ai_messages()
+        start_ai_count = len(current_ai_messages)
+        baseline_last_ai = current_ai_messages[-1]['content'] if current_ai_messages else ""
+        baseline_loading = await self._get_loading_message_text()
+
+        await self._send_message(message)
+        send_time = time.time()
+        self.logger.info(f"Send timestamp: {datetime.datetime.now().isoformat()}")
+
+        last_content = self._normalize_stream_text(baseline_last_ai)
+        stable_cycles = 0
+        start_time = time.time()
+        last_change_time = start_time
+        first_token_logged = False
+
+        while time.time() - start_time < timeout:
+            await asyncio.sleep(self.capture_interval)
+
+            current_ai_messages = await self._get_current_ai_messages()
+            loading_text = await self._get_loading_message_text()
+            latest = loading_text or (current_ai_messages[-1]['content'] if current_ai_messages else "")
+            latest = self._normalize_stream_text(latest)
+            if not latest:
+                continue
+
+            if loading_text:
+                if loading_text == baseline_loading:
+                    continue
+            else:
+                if len(current_ai_messages) == start_ai_count and latest == baseline_last_ai:
+                    continue
+
+            if latest != last_content:
+                if not first_token_logged:
+                    first_token_logged = True
+                    self.logger.info(
+                        f"First token received at {datetime.datetime.now().isoformat()} "
+                        f"(latency {time.time() - send_time:.3f}s)"
+                    )
+                if latest.startswith(last_content):
+                    delta = latest[len(last_content):]
+                elif last_content and last_content.startswith(latest):
+                    delta = ""
+                else:
+                    delta = latest
+                if delta:
+                    self.logger.info(
+                        f"Delta at {datetime.datetime.now().isoformat()} (len {len(delta)})"
+                    )
+                    yield delta
+                last_content = latest
+                stable_cycles = 0
+                last_change_time = time.time()
+            else:
+                stable_cycles += 1
+
+            time_since_change = time.time() - last_change_time
+            loading_present = await self._is_loading_message_present()
+            send_button_present = await self._is_send_button_present()
+            if stable_cycles >= self.streaming_wait_cycles and time_since_change >= self.min_stable_seconds and (not loading_present or send_button_present):
+                # Save final AI message
+                await self._save_message_by_index("ai", len(current_ai_messages) - 1, current_ai_messages[-1])
+                self.last_ai_index_written = len(current_ai_messages) - 1
+                return
+
+        raise TimeoutError("Timed out waiting for AI response")
+    
+    def _generate_message_id(self, message_type: str, index: int) -> str:
+        """Generate simple ID based on message type and index."""
+        return f"{message_type}_{index}"
+    
+    async def _capture_messages(self) -> int:
+        """Capture new user and AI messages by comparing list lengths."""
+        new_messages = 0
+        
+        try:
+            print(f"🔍 Loop #{self.loop_count}: Checking for new messages...")
+            
+            # Check if page is still responsive
+            try:
+                page_title = await self.page.title()
+                current_url = self.page.url
+                print(f"📄 Page: {page_title} ({current_url})")
+            except Exception as e:
+                print(f"❌ Page not responsive: {e}")
+                return 0
+            
+            # Get current messages from page
+            current_user_messages = await self._get_current_user_messages()
+            current_ai_messages = await self._get_current_ai_messages()
+            
+            print(f"� Found {len(current_user_messages)} user messages, {len(current_ai_messages)} AI messages")
+            print(f"📊 Previously written: {self.last_user_index_written + 1} user, {self.last_ai_index_written + 1} AI")
+            
+            # Handle user messages (immediate capture - no streaming)
+            if len(current_user_messages) > len(self.user_messages_list):
+                # We have new user messages
+                new_user_messages = current_user_messages[len(self.user_messages_list):]
+                self.user_messages_list.extend(new_user_messages)
+                
+                # Write new user messages to file immediately
+                for i, message_data in enumerate(new_user_messages):
+                    message_index = len(self.user_messages_list) - len(new_user_messages) + i
+                    await self._save_message_by_index("user", message_index, message_data)
+                    self.last_user_index_written = message_index
+                    new_messages += 1
+            
+            # Handle AI messages (wait for streaming to complete)
+            ai_messages_ready = await self._check_ai_streaming_complete(current_ai_messages)
+            
+            if len(current_ai_messages) > len(self.ai_messages_list):
+                # We have new AI messages
+                new_ai_messages = current_ai_messages[len(self.ai_messages_list):]
+                
+                # Update our list but only save completed messages
+                for i, message_data in enumerate(new_ai_messages):
+                    message_index = len(self.ai_messages_list) + i
+                    
+                    if message_index in ai_messages_ready:
+                        # This message is ready to be saved
+                        self.ai_messages_list.append(message_data)
+                        await self._save_message_by_index("ai", message_index, message_data)
+                        self.last_ai_index_written = message_index
+                        new_messages += 1
+                        print(f"✅ AI message #{message_index} completed and saved")
+                    else:
+                        # This message is still streaming, don't save yet
+                        print(f"⏳ AI message #{message_index} still streaming, waiting...")
+                        break  # Don't process further messages until this one is complete
+            
+            # Also check if any existing AI messages have finished streaming
+            elif len(current_ai_messages) == len(self.ai_messages_list):
+                # Check if the last AI message has been updated (still streaming)
+                if current_ai_messages and len(current_ai_messages) > self.last_ai_index_written + 1:
+                    last_message_index = len(current_ai_messages) - 1
+                    if last_message_index in ai_messages_ready:
+                        # The last message is now complete, update it
+                        self.ai_messages_list[last_message_index] = current_ai_messages[last_message_index]
+                        await self._save_message_by_index("ai", last_message_index, current_ai_messages[last_message_index])
+                        self.last_ai_index_written = last_message_index
+                        new_messages += 1
+                        print(f"✅ AI message #{last_message_index} finished streaming and saved")
+            
+            return new_messages
+            
+        except Exception as e:
+            self.logger.error(f"Error capturing messages: {e}")
+            print(f"❌ Error in capture: {e}")
+            return 0
+    
+    async def _check_ai_streaming_complete(self, current_ai_messages):
+        """Check which AI messages have completed streaming."""
+        ready_messages = set()
+        
+        for i, message_data in enumerate(current_ai_messages):
+            message_content = message_data['content']
+            content_length = len(message_content)
+            
+            # Track this message's length history
+            if i not in self.ai_streaming_tracker:
+                self.ai_streaming_tracker[i] = {
+                    'lengths': [],
+                    'stable_cycles': 0
+                }
+            
+            tracker = self.ai_streaming_tracker[i]
+            tracker['lengths'].append(content_length)
+            
+            # Keep only recent lengths (last 5 cycles)
+            if len(tracker['lengths']) > 5:
+                tracker['lengths'] = tracker['lengths'][-5:]
+            
+            # Check if length has been stable
+            if len(tracker['lengths']) >= 2:
+                if tracker['lengths'][-1] == tracker['lengths'][-2]:
+                    tracker['stable_cycles'] += 1
+                else:
+                    tracker['stable_cycles'] = 0
+            
+            # Message is ready if it's been stable for enough cycles
+            # OR if it looks complete (ends with proper punctuation/formatting)
+            is_stable = tracker['stable_cycles'] >= self.streaming_wait_cycles
+            looks_complete = self._message_looks_complete(message_content)
+            
+            if is_stable or looks_complete:
+                ready_messages.add(i)
+                print(f"🎯 AI message #{i} detected as complete (stable: {is_stable}, looks_complete: {looks_complete})")
+            else:
+                print(f"⏳ AI message #{i} still streaming (length: {content_length}, stable_cycles: {tracker['stable_cycles']})")
+        
+        return ready_messages
+    
+    def _message_looks_complete(self, content):
+        """Heuristic to determine if a message looks complete."""
+        if not content.strip():
+            return False
+        
+        content = content.strip()
+        
+        # Check for typical AI response endings
+        complete_endings = [
+            '.',  # Ends with period
+            '!',  # Ends with exclamation
+            '?',  # Ends with question
+            ':',  # Ends with colon (like "Here's what you need:")
+            ')',  # Ends with closing parenthesis
+            '"',  # Ends with quote
+            '`',  # Ends with code block
+        ]
+        
+        # Check for incomplete indicators
+        incomplete_indicators = [
+            content.endswith('E'),  # Often ends with 'E' when streaming "Edit in a page"
+            content.endswith(' '),  # Ends with space (usually mid-word)
+            len(content) < 10,      # Too short to be complete
+            content.count('\n') == 0 and len(content) > 200 and not any(content.endswith(end) for end in complete_endings)  # Long single line without proper ending
+        ]
+        
+        # If any incomplete indicator is true, it's not complete
+        if any(incomplete_indicators):
+            return False
+        
+        # If it ends with a complete ending, it's likely complete
+        if any(content.endswith(end) for end in complete_endings):
+            return True
+        
+        # Default to not complete if unsure
+        return False
+    
+    async def _get_current_user_messages(self):
+        """Get all current user messages from the page."""
+        messages = []
+        
+        # Try multiple selectors for user messages
+        selectors = [
+            '[data-testid="chatOutput"]',
+            '[data-content="user-message"]',
+            '[data-testid="user-message"]',
+            '.user-message'
+        ]
+        
+        for selector in selectors:
+            try:
+                elements = await self.page.query_selector_all(selector)
+                if elements:
+                    for element in elements:
+                        try:
+                            text = await element.inner_text()
+                            if text.strip():
+                                box = await element.bounding_box()
+                                html_snippet = await element.inner_html()
+                                messages.append({
+                                    'content': text.strip(),
+                                    'html_snippet': html_snippet[:500] if html_snippet else "",
+                                    'element_location': box
+                                })
+                        except Exception as e:
+                            self.logger.debug(f"Error processing user message element: {e}")
+                    return messages  # Return from first successful selector
+            except Exception as e:
+                self.logger.debug(f"Error with user selector {selector}: {e}")
+                continue
+        
+        # Fallback: try smart detection
+        return await self._get_messages_smart_detection("user")
+    
+    async def _get_current_ai_messages(self):
+        """Get all current AI messages from the page."""
+        messages = []
+        
+        # Try multiple selectors for AI messages
+        selectors = [
+            '[data-testid="copilot-message-reply-div"]',
+            '[data-testid="m365-chat-llm-web-ui-chat-message"]',
+            '[data-testid="copilot-message-div"]',
+            '[data-testid="lastChatMessage"]',
+            '[data-testid="markdown-reply"]',
+            '[data-content="ai-message"]',
+            '[data-testid="bot-message"]',
+            '[data-testid="ai-message"]',
+            '.ai-message',
+            '.bot-message'
+        ]
+        
+        for selector in selectors:
+            try:
+                elements = await self.page.query_selector_all(selector)
+                if elements:
+                    for element in elements:
+                        try:
+                            text = await element.inner_text()
+                            if text.strip():
+                                # Clean AI message text
+                                clean_text = text.strip()
+                                if "Copilot said" in clean_text:
+                                    clean_text = clean_text.replace("Copilot said", "").strip()
+                                    if clean_text.endswith("Edit in a page"):
+                                        clean_text = clean_text[:-13].strip()
+                                
+                                if clean_text:  # Only add if there's actual content
+                                    box = await element.bounding_box()
+                                    html_snippet = await element.inner_html()
+                                    messages.append({
+                                        'content': clean_text,
+                                        'html_snippet': html_snippet[:500] if html_snippet else "",
+                                        'element_location': box
+                                    })
+                        except Exception as e:
+                            self.logger.debug(f"Error processing AI message element: {e}")
+                    return messages  # Return from first successful selector
+            except Exception as e:
+                self.logger.debug(f"Error with AI selector {selector}: {e}")
+                continue
+        
+        # Fallback: try smart detection
+        return await self._get_messages_smart_detection("ai")
+    
+    async def _get_messages_smart_detection(self, target_type):
+        """Fallback method to detect messages using smart heuristics."""
+        messages = []
+        
+        # Generic selectors that might contain messages
+        generic_selectors = [
+            'article',
+            '[role="listitem"]',
+            '[class*="message"]',
+            'div[class*="chat"]'
+        ]
+        
+        for selector in generic_selectors:
+            try:
+                elements = await self.page.query_selector_all(selector)
+                for element in elements:
+                    try:
+                        text = await element.inner_text()
+                        if text.strip() and len(text.strip()) > 5:
+                            message_type = await self._determine_message_type(element, text)
+                            if message_type == target_type:
+                                # Clean text based on type
+                                clean_text = text.strip()
+                                if message_type == "ai" and "Copilot said" in clean_text:
+                                    clean_text = clean_text.replace("Copilot said", "").strip()
+                                    if clean_text.endswith("Edit in a page"):
+                                        clean_text = clean_text[:-13].strip()
+                                
+                                if clean_text:
+                                    box = await element.bounding_box()
+                                    html_snippet = await element.inner_html()
+                                    messages.append({
+                                        'content': clean_text,
+                                        'html_snippet': html_snippet[:500] if html_snippet else "",
+                                        'element_location': box
+                                    })
+                    except Exception as e:
+                        self.logger.debug(f"Error in smart detection: {e}")
+                        continue
+                
+                if messages:
+                    return messages  # Return if we found any messages
+            except Exception as e:
+                self.logger.debug(f"Error with generic selector {selector}: {e}")
+                continue
+        
+        return messages
+    
+    async def _determine_message_type(self, element, text):
+        """Determine if message is from user or AI based on content and attributes."""
+        try:
+            # Check element attributes
+            classes = await element.get_attribute('class') or ""
+            
+            # Check data attributes
+            data_attrs = await element.evaluate('''el => {
+                const attrs = {};
+                for (let attr of el.attributes) {
+                    if (attr.name.startsWith('data-')) {
+                        attrs[attr.name] = attr.value;
+                    }
+                }
+                return attrs;
+            }''')
+            
+            # Check parent attributes
+            parent_classes = ""
+            try:
+                parent_classes = await element.evaluate('el => el.parentElement?.className || ""')
+            except:
+                pass
+            
+            # Combine all attribute text for analysis
+            all_attrs = f"{classes} {parent_classes} {str(data_attrs)}".lower()
+            
+            # Heuristics for message type detection
+            if any(keyword in all_attrs for keyword in ['user', 'human', 'input']):
+                return "user"
+            elif any(keyword in all_attrs for keyword in ['assistant', 'ai', 'bot', 'copilot']):
+                return "ai"
+            elif any(keyword in text.lower() for keyword in ['you:', 'user:']):
+                return "user"
+            elif len(text) > 50:  # Longer messages are often AI responses
+                return "ai"
+            else:
+                return "unknown"
+                
+        except Exception:
+            return "unknown"
+    
+    async def _save_message_by_index(self, message_type: str, index: int, message_data: dict):
+        """Save a message to file using list index."""
+        try:
+            timestamp = datetime.datetime.now().isoformat()
+            message_id = self._generate_message_id(message_type, index)
+            
+            # Create message data for file
+            file_data = {
+                'timestamp': timestamp,
+                'message_id': message_id,
+                'type': message_type,
+                'content': message_data['content'],
+                'html_snippet': message_data['html_snippet'],
+                'element_location': message_data['element_location']
+            }
+            
+            # Save to file
+            with open(self.output_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(file_data, ensure_ascii=False) + '\n')
+            
+            # Update count
+            self.message_count += 1
+            
+            # Print to console for immediate feedback
+            type_emoji = "👤" if message_type == "user" else "🤖"
+            preview = message_data['content'][:100] + "..." if len(message_data['content']) > 100 else message_data['content']
+            print(f"{type_emoji} [{message_type.upper()} #{index}] {preview}")
+            
+            self.logger.debug(f"Captured {message_type} message #{index}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving message: {e}")
+    
+    async def start_capture(self, navigate_to_copilot: bool = False):
+        """Start the capture process."""
+        try:
+            # Connect to existing browser
+            self.browser, self.page = await self._connect_to_browser()
+            
+            # Optionally navigate to Copilot
+            if navigate_to_copilot:
+                self.logger.info("Selecting Copilot chat tab...")
+                await self._select_copilot_page(allow_open=True)
+            
+            # Wait for user to setup if needed
+            await self._wait_for_user_ready()
+
+            if self.self_test_enabled:
+                test_ok = await self._run_self_test()
+                if not test_ok:
+                    self.logger.warning("Self-test failed to capture messages within timeout")
+            
+            # Write session header
+            current_url = self.page.url
+            with open(self.output_file, 'a', encoding='utf-8') as f:
+                session_info = {
+                    'session_start': datetime.datetime.now().isoformat(),
+                    'url': current_url,
+                    'capture_method': 'playwright_cdp',
+                    'cdp_endpoint': self.cdp_endpoint,
+                    'target_selectors': {
+                        'user_messages': '[data-testid="chatOutput"]',
+                        'ai_messages': '[data-testid="markdown-reply"]'
+                    }
+                }
+                f.write(json.dumps(session_info, ensure_ascii=False) + '\n')
+            
+            print(f"\n🔄 Starting continuous capture...")
+            print(f"📁 Output file: {self.output_file}")
+            print(f"⏱️  Checking every {self.capture_interval} seconds")
+            print(f"⏹️  Press Ctrl+C to stop\n")
+            
+            self.running = True
+            last_count = 0
+            
+            # Main capture loop
+            while self.running:
+                try:
+                    self.loop_count += 1
+                    print(f"\n--- Loop #{self.loop_count} ---")
+                    print(f"Running: {self.running}")
+                    print(f"Browser connected: {self.browser is not None}")
+                    print(f"Page responsive: {self.page is not None}")
+                    
+                    new_messages = await self._capture_messages()
+                    
+                    if new_messages > 0:
+                        print(f"✅ Captured {new_messages} new messages (Total: {self.message_count})")
+                    elif self.message_count != last_count:
+                        print(f"📊 Total messages captured: {self.message_count}")
+                        last_count = self.message_count
+                    else:
+                        print(f"💤 No new messages found (Total: {self.message_count})")
+                    
+                    print(f"⏱️  Sleeping for {self.capture_interval} seconds...")
+                    await asyncio.sleep(self.capture_interval)
+
+                    if self.self_test_enabled:
+                        # Exit after first loop post self-test to avoid long-running capture
+                        self.running = False
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("Capture interrupted by user")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error during capture loop: {e}")
+                    print(f"❌ Exception in loop: {e}")
+                    print("⏱️  Waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)  # Wait before retrying
+            
+            print(f"\n🛑 Loop ended. Running: {self.running}")
+                    
+        except Exception as e:
+            self.logger.error(f"Fatal error: {e}")
+            print(f"💀 Fatal error: {e}")
+        finally:
+            await self._cleanup()
+    
+    async def _cleanup(self):
+        """Clean up resources."""
+        print("\n🧹 Starting cleanup...")
+        try:
+            # Note: We don't close the browser since we didn't launch it
+            # The browser will remain open for the user
+            self.logger.info("✓ Disconnected from browser (browser remains open)")
+            print("✓ Disconnected from browser (browser remains open)")
+        except Exception as e:
+            self.logger.debug(f"Error during cleanup: {e}")
+            print(f"Error during cleanup: {e}")
+        
+        # Write session footer
+        try:
+            with open(self.output_file, 'a', encoding='utf-8') as f:
+                session_end = {
+                    'session_end': datetime.datetime.now().isoformat(),
+                    'total_messages_captured': self.message_count,
+                    'total_user_messages': len(self.user_messages_list),
+                    'total_ai_messages': len(self.ai_messages_list),
+                    'last_user_index_written': self.last_user_index_written,
+                    'last_ai_index_written': self.last_ai_index_written,
+                    'total_loops': self.loop_count
+                }
+                f.write(json.dumps(session_end, ensure_ascii=False) + '\n')
+        except Exception as e:
+            self.logger.debug(f"Error writing session footer: {e}")
+        
+        print(f"\n✅ Capture complete!")
+        print(f"📊 Total messages captured: {self.message_count}")
+        print(f"🔄 Total loops executed: {self.loop_count}")
+        print(f"📁 Output saved to: {self.output_file}")
+
+
+async def main():
+    """Main function."""
+    print("🤖 Microsoft Copilot Chat Capture (CDP VERSION)")
+    print("=" * 50)
+    print("This version connects to existing browser in developer mode")
+    print()
+    
+    print("🔧 SETUP INSTRUCTIONS:")
+    print("1. First, launch Chrome in developer mode:")
+    print('   chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\temp\\chrome-debug"')
+    print()
+    print("2. Then run this script")
+    print("=" * 50)
+    print()
+    
+    try:
+        capture = CopilotChatCaptureCDP(
+            output_file="copilot_cdp_capture.txt",
+            capture_interval=2.0,  # Slower interval for debugging
+            cdp_endpoint="http://172.27.240.1:9222",
+            auto_select_copilot_tab=True,
+            auto_start_without_prompt=True,
+            self_test_enabled=True
+        )
+
+        await capture.start_capture(navigate_to_copilot=True)
+
+    except KeyboardInterrupt:
+        print("\n✅ Capture stopped by user")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
