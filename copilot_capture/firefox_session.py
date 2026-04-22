@@ -204,12 +204,19 @@ class FirefoxCopilotSession:
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for AI response")
             event = await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
-            if event.kind in {"assistant_final", "assistant_delta", "user_message"}:
+            if event.kind == "assistant_final":
+                answer = self._current_answer(turn)
+                if event.raw_type == 2 and answer.strip():
+                    if self._looks_like_prompt_echo(turn, answer):
+                        raise TimeoutError("Copilot echoed the prompt without producing an assistant answer")
+                    return answer
+                continue
+            if event.kind in {"assistant_delta", "user_message"}:
                 continue
             if event.kind in {"completion", "socket_close"}:
                 # Drain any trailing events quickly
                 await self._drain_briefly(turn, deadline)
-                answer = turn.response_text or turn.full_text or turn.stream_text
+                answer = self._current_answer(turn)
                 if answer.strip():
                     if self._looks_like_prompt_echo(turn, answer):
                         raise TimeoutError("Copilot echoed the prompt without producing an assistant answer")
@@ -236,8 +243,11 @@ class FirefoxCopilotSession:
                 raise TimeoutError("Timed out waiting for streamed AI response")
             event = await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
             if event.kind in {"assistant_delta", "assistant_final"}:
-                snapshot = turn.response_text or turn.full_text or turn.stream_text or event.content
+                snapshot = self._current_answer(turn) or event.content
                 last_snapshot = self._emit_snapshot(emit, snapshot, last_snapshot)
+                if event.kind == "assistant_final" and event.raw_type == 2:
+                    emit("done", None)
+                    return
             elif event.kind in {"completion", "socket_close"}:
                 # Drain remaining events quickly, then finish
                 await self._drain_stream_tail(turn, deadline, emit, last_snapshot)
@@ -262,12 +272,16 @@ class FirefoxCopilotSession:
             except asyncio.TimeoutError:
                 break
             if event.kind in {"assistant_delta", "assistant_final"}:
-                snapshot = turn.response_text or turn.full_text or turn.stream_text or event.content
+                snapshot = self._current_answer(turn) or event.content
                 last_snapshot = self._emit_snapshot(emit, snapshot, last_snapshot)
         # Final snapshot
-        final = turn.response_text or turn.full_text or turn.stream_text
+        final = self._current_answer(turn)
         if final and final != last_snapshot:
             emit("snapshot", final)
+
+    @staticmethod
+    def _current_answer(turn: TurnContext) -> str:
+        return turn.full_text or turn.response_text or turn.stream_text
 
     @staticmethod
     def _emit_snapshot(emit: Callable[[str, Any], None], snapshot: str, last_snapshot: str) -> str:

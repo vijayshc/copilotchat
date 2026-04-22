@@ -1,46 +1,47 @@
 #$env:PORT="5099"; python app.py
 import json
+import logging
 import os
 import queue
 import threading
+import traceback
 import uuid
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
-from dotenv import load_dotenv
-from werkzeug.serving import WSGIRequestHandler
+from pathlib import Path
 
-from copilot_capture.constants import get_playwright_browser_name, resolve_browser_profile_dir
-from copilot_capture import CopilotChatCapture
-from copilot_capture.openai_proxy import DEFAULT_PROXY_MODEL, OpenAICompatProxy, OpenAIProxyError
 
-# Local defaults for the Playwright browser + WebSocket capture flow.
-# Blank values fall back to the application defaults.
+def _bootstrap_failure_log_path() -> Path:
+    configured_dir = (os.environ.get("COPILOT_LOG_DIR") or "").strip()
+    log_dir = Path(configured_dir).expanduser().resolve() if configured_dir else Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "copilot-startup.log"
 
-# COPILOT_URL=https://m365.cloud.microsoft/chat/
-# # Browser engine used by Playwright automation: firefox or chrome
-# COPILOT_BROWSER=firefox
-# # Leave blank to use the built-in default profile directory.
-# # Windows default: %LOCALAPPDATA%\copilot-firefox-profile
-# # Linux/macOS default: ~/.playwright-firefox-profile
-# COPILOT_FIREFOX_PROFILE=
-# # Leave blank to use the built-in default profile directory.
-# # Windows default: %LOCALAPPDATA%\copilot-chrome-profile
-# # Linux/macOS default: ~/.playwright-chrome-profile
-# COPILOT_CHROME_PROFILE=
-# # Optional when COPILOT_BROWSER=chrome. Defaults to "chrome" and falls back to bundled chromium if unavailable.
-# COPILOT_CHROME_CHANNEL=chrome
-# COPILOT_HEADLESS=false
-# # Set to true only when you explicitly want credential-driven Microsoft sign-in automation.
-# # Keep false in production so sign-in happens manually (or via an already authenticated profile).
-# COPILOT_AUTO_LOGIN=false
-# COPILOT_CAPTURE_FILE=copilot_cdp_capture.txt
-# COPILOT_CAPTURE_INTERVAL=0.05
-# COPILOT_LOGIN_TIMEOUT=300
-# COPILOT_LAUNCH_TIMEOUT=60
-# COPILOT_USERNAME=
-# COPILOT_PASSWORD=
-# PORT=5000
+
+def _write_bootstrap_failure(stage: str) -> None:
+    try:
+        with _bootstrap_failure_log_path().open("a", encoding="utf-8") as handle:
+            handle.write(f"[{stage}]\n")
+            handle.write(traceback.format_exc())
+            handle.write("\n")
+    except Exception:
+        pass
+
+
+try:
+    from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+    from dotenv import load_dotenv
+    from werkzeug.serving import WSGIRequestHandler
+
+    from copilot_capture.constants import get_playwright_browser_name, resolve_browser_profile_dir
+    from copilot_capture import CopilotChatCapture
+    from copilot_capture.logging_utils import configure_runtime_logging
+    from copilot_capture.openai_proxy import DEFAULT_PROXY_MODEL, OpenAICompatProxy, OpenAIProxyError
+except Exception:
+    _write_bootstrap_failure("import")
+    raise
 
 load_dotenv()
+RUNTIME_LOG_PATH = configure_runtime_logging()
+logger = logging.getLogger(__name__)
 
 # Use HTTP/1.1 so Werkzeug flushes SSE chunks immediately
 WSGIRequestHandler.protocol_version = "HTTP/1.1"
@@ -61,6 +62,12 @@ def get_capture_service() -> CopilotChatCapture:
         with _capture_service_lock:
             if _capture_service is None:
                 browser_name = get_playwright_browser_name(os.environ.get("COPILOT_BROWSER"))
+                logger.info(
+                    "Creating capture service browser=%s headless=%s runtime_log=%s",
+                    browser_name,
+                    os.environ.get("COPILOT_HEADLESS", "false").lower() == "true",
+                    RUNTIME_LOG_PATH,
+                )
                 _capture_service = CopilotChatCapture(
                     copilot_url=os.environ.get("COPILOT_URL", "https://m365.cloud.microsoft/chat/"),
                     user_data_dir=resolve_browser_profile_dir(browser_name),
@@ -73,6 +80,7 @@ def get_capture_service() -> CopilotChatCapture:
 
 
 def _send_and_receive(message: str) -> str:
+    logger.info("Handling non-stream Copilot request prompt_length=%s", len(message))
     return get_capture_service().send_message_and_wait_for_ai_sync(message, timeout=180.0)
 
 
@@ -86,6 +94,7 @@ def _stream_response(message: str):
                     q.put(("snapshot", payload))
             q.put(("end", ""))
         except Exception as e:
+            logger.exception("Streaming Copilot request failed")
             q.put(("error", str(e)))
 
     threading.Thread(target=worker, daemon=True).start()
@@ -111,6 +120,7 @@ def get_openai_proxy() -> OpenAICompatProxy:
     if _openai_proxy is None:
         with _openai_proxy_lock:
             if _openai_proxy is None:
+                logger.info("Creating OpenAI compatibility proxy")
                 proxy_kwargs = {
                     "send_prompt": _send_and_receive,
                     "default_model": os.environ.get("OPENAI_PROXY_MODEL", DEFAULT_PROXY_MODEL),
@@ -138,6 +148,20 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return _json_response(
+        {
+            "status": "ok",
+            "browser": get_playwright_browser_name(os.environ.get("COPILOT_BROWSER")),
+            "headless": os.environ.get("COPILOT_HEADLESS", "false").lower() == "true",
+            "capture_initialized": _capture_service is not None,
+            "openai_proxy_initialized": _openai_proxy is not None,
+            "runtime_log": str(RUNTIME_LOG_PATH),
+        }
+    )
+
+
 @app.route("/send", methods=["POST"])
 def send_message():
     data = request.get_json(silent=True) or {}
@@ -153,6 +177,7 @@ def send_message():
             content_type="application/json; charset=utf-8",
         )
     except Exception as e:
+        logger.exception("/send request failed")
         return Response(
             json.dumps({"error": str(e)}, ensure_ascii=False),
             status=500,
@@ -170,6 +195,7 @@ def send_stream():
         return jsonify({"error": "Message cannot be empty."}), 400
 
     stream_id = uuid.uuid4().hex
+    logger.info("Registered streaming request stream_id=%s prompt_length=%s", stream_id, len(message))
     _pending_streams[stream_id] = message
     return jsonify({"stream_id": stream_id})
 
@@ -179,9 +205,11 @@ def stream_events(stream_id):
     """Step 2: EventSource connects here (GET) to receive SSE events."""
     message = _pending_streams.pop(stream_id, None)
     if not message:
+        logger.warning("Rejected stream_events request for invalid stream_id=%s", stream_id)
         return Response("event: stream_error\ndata: {\"error\": \"Invalid or expired stream id.\"}\n\n",
                         content_type="text/event-stream; charset=utf-8")
 
+    logger.info("Opening SSE stream stream_id=%s prompt_length=%s", stream_id, len(message))
     return Response(stream_with_context(_stream_response(message)),
                     content_type="text/event-stream; charset=utf-8",
                     headers={
@@ -218,6 +246,7 @@ def openai_chat_completions():
         )
 
     try:
+        logger.info("Handling /v1/chat/completions stream=%s message_count=%s", bool(data.get("stream")), len(data.get("messages") or []))
         if bool(data.get("stream")):
             stream = get_openai_proxy().stream_chat_completion(data)
             return Response(
@@ -231,8 +260,10 @@ def openai_chat_completions():
             )
         return _json_response(get_openai_proxy().create_chat_completion(data))
     except OpenAIProxyError as exc:
+        logger.exception("OpenAI compatibility request failed with proxy error")
         return _openai_error_response(exc)
     except Exception as exc:
+        logger.exception("OpenAI compatibility request failed with server error")
         return _json_response(
             {
                 "error": {
@@ -248,4 +279,18 @@ def openai_chat_completions():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5056"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    browser_name = get_playwright_browser_name(os.environ.get("COPILOT_BROWSER"))
+    logger.info(
+        "Starting Flask server port=%s browser=%s headless=%s auto_login=%s runtime_log=%s",
+        port,
+        browser_name,
+        os.environ.get("COPILOT_HEADLESS", "false").lower() == "true",
+        os.environ.get("COPILOT_AUTO_LOGIN", "false").lower() in {"1", "true", "yes", "on", "y"},
+        RUNTIME_LOG_PATH,
+    )
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    except Exception:
+        logger.exception("Flask server failed to start")
+        _write_bootstrap_failure("app.run")
+        raise

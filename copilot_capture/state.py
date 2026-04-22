@@ -48,17 +48,13 @@ class ConversationState:
                 return
             if not self._matches_turn(event, turn):
                 return
-            fragment = event.content.replace("\r\n", "\n")
-            merged_stream = self._merge_stream_fragment(
-                turn.stream_text, fragment, event.streaming_mode
-            )
+            fragment = normalize_line_endings(event.content)
+            merged_stream = self._merge_stream_fragment(turn.stream_text, fragment, event.streaming_mode)
             if self._looks_like_prompt_echo(turn, merged_stream):
                 return
             turn.stream_text = merged_stream
-            turn.response_text = self._merge_response_text(
-                turn.response_text,
-                turn.stream_text,
-            )
+            if not turn.full_text:
+                turn.response_text = turn.stream_text
             await turn.event_queue.put(event)
             return
 
@@ -67,17 +63,14 @@ class ConversationState:
                 return
             if not self._matches_turn(event, turn):
                 return
-            content = event.content.replace("\r\n", "\n")
+            content = normalize_line_endings(event.content)
             if self._looks_like_prompt_echo(turn, content):
                 return
-            if len(content) >= len(turn.full_text):
-                turn.full_text = self._merge_response_text(turn.full_text, content)
+            if event.raw_type == 2:
+                turn.full_text = content
             else:
-                turn.full_text = self._merge_response_text(content, turn.full_text)
-            turn.response_text = self._merge_response_text(
-                turn.response_text,
-                turn.full_text,
-            )
+                turn.full_text = self._prefer_longer_text(turn.full_text, content)
+            turn.response_text = turn.full_text or self._prefer_longer_text(turn.response_text, content)
             turn.assistant_message_id = event.message_id or turn.assistant_message_id
             await turn.event_queue.put(event)
             return
@@ -140,34 +133,26 @@ class ConversationState:
                 return fragment
             if existing.startswith(fragment):
                 return existing
+            overlap = ConversationState._find_overlap(existing, fragment)
+            if overlap > 0:
+                return existing + fragment[overlap:]
             return existing + fragment
 
-        # Snapshot / replace mode — take whichever is longer
-        if len(fragment) >= len(existing):
+        if fragment.startswith(existing) or len(fragment) >= len(existing):
             return fragment
         return existing
 
-    @classmethod
-    def _merge_response_text(cls, existing: str, incoming: str) -> str:
-        existing = existing.replace("\r\n", "\n") if existing else ""
-        incoming = incoming.replace("\r\n", "\n") if incoming else ""
+    @staticmethod
+    def _prefer_longer_text(existing: str, incoming: str) -> str:
+        existing = normalize_line_endings(existing)
+        incoming = normalize_line_endings(incoming)
         if not existing:
             return incoming
         if not incoming:
             return existing
-        if existing == incoming or incoming in existing:
-            return existing
-        if existing in incoming:
+        if incoming.startswith(existing) or len(incoming) >= len(existing):
             return incoming
-
-        overlap = cls._find_overlap(existing, incoming)
-        if overlap > 0:
-            return existing + incoming[overlap:]
-
-        if cls._looks_like_continuation(existing, incoming):
-            return existing + incoming
-
-        return incoming if len(incoming) >= len(existing) else existing
+        return existing
 
     @staticmethod
     def _find_overlap(existing: str, incoming: str) -> int:
@@ -176,15 +161,3 @@ class ConversationState:
             if existing[-size:] == incoming[:size]:
                 return size
         return 0
-
-    @staticmethod
-    def _looks_like_continuation(existing: str, incoming: str) -> bool:
-        if not existing or not incoming:
-            return False
-        stripped = incoming.lstrip()
-        if not stripped:
-            return False
-        first = stripped[0]
-        if incoming[0].isspace() or first in {'.', ',', ':', ';', '!', '?', ')', ']', '}', '-', '—', "'", '’', '"'}:
-            return True
-        return first.islower()

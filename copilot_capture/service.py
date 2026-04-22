@@ -18,6 +18,7 @@ from .constants import (
     get_playwright_browser_name,
 )
 from .firefox_session import FirefoxCopilotSession
+from .logging_utils import configure_runtime_logging
 
 
 class CopilotChatCapture:
@@ -41,7 +42,7 @@ class CopilotChatCapture:
         self.login_timeout = login_timeout
         self.launch_timeout = launch_timeout
 
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+        self.runtime_log_path = configure_runtime_logging()
         self.logger = logging.getLogger(__name__)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -57,6 +58,13 @@ class CopilotChatCapture:
             launch_timeout=self.launch_timeout,
             logger=self.logger,
         )
+        self.logger.info(
+            "Initialized CopilotChatCapture browser=%s profile=%s headless=%s runtime_log=%s",
+            self.browser_name,
+            self.user_data_dir,
+            self.headless,
+            self.runtime_log_path,
+        )
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT, self._signal_handler)
             signal.signal(signal.SIGTERM, self._signal_handler)
@@ -70,6 +78,7 @@ class CopilotChatCapture:
         if self._thread and self._thread.is_alive():
             return
         self._loop_ready.clear()
+        self.logger.info("Starting Copilot worker loop thread")
         self._thread = threading.Thread(target=self._run_loop, name="copilot-loop", daemon=True)
         self._thread.start()
         self._loop_ready.wait(timeout=10)
@@ -77,16 +86,25 @@ class CopilotChatCapture:
             raise RuntimeError("Failed to start the Copilot worker loop")
 
     def _run_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop_ready.set()
-        self._loop.run_forever()
-        pending = asyncio.all_tasks(self._loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        self._loop.close()
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop_ready.set()
+            self.logger.info("Copilot worker loop started")
+            self._loop.run_forever()
+        except Exception:
+            self.logger.exception("Copilot worker loop crashed")
+            raise
+        finally:
+            if self._loop is None:
+                return
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.close()
+            self.logger.info("Copilot worker loop stopped")
 
     def _submit(self, coro: Coroutine[Any, Any, Any]):
         self._ensure_worker()
@@ -95,15 +113,18 @@ class CopilotChatCapture:
 
     def send_message_and_wait_for_ai_sync(self, message: str, timeout: float = 60.0) -> str:
         with self._request_lock:
+            self.logger.info("Submitting synchronous Copilot request prompt_length=%s timeout=%s", len(message), timeout)
             return self._submit(self._session.send_message_and_wait(message, timeout)).result(timeout=timeout + 90)
 
     def start_new_chat_sync(self, timeout: float = 60.0) -> None:
         with self._request_lock:
+            self.logger.info("Submitting new chat reset timeout=%s", timeout)
             self._submit(self._session.start_new_chat()).result(timeout=timeout + 30)
 
     def stream_ai_response_sync(self, message: str, timeout: float = 60.0) -> Iterator[tuple[str, Any]]:
         """Yields (kind, payload) tuples: ("snapshot", text) or ("done", None)."""
         with self._request_lock:
+            self.logger.info("Submitting streaming Copilot request prompt_length=%s timeout=%s", len(message), timeout)
             stream_queue: Queue[tuple[str, Any]] = Queue()
 
             def emit(kind: str, payload: Any) -> None:
@@ -127,6 +148,7 @@ class CopilotChatCapture:
         if self._closed:
             return
         self._closed = True
+        self.logger.info("Closing CopilotChatCapture")
         if self._loop is None:
             return
         try:
