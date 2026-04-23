@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import queue
+import socket as _socket
 import threading
 import traceback
 import uuid
@@ -45,6 +46,20 @@ logger = logging.getLogger(__name__)
 
 # Use HTTP/1.1 so Werkzeug flushes SSE chunks immediately
 WSGIRequestHandler.protocol_version = "HTTP/1.1"
+
+
+class _NagleDisabledRequestHandler(WSGIRequestHandler):
+    """Werkzeug request handler with TCP_NODELAY disabled so each SSE chunk
+    is sent immediately without being coalesced by the OS Nagle algorithm.
+    Without this, multiple small SSE events can arrive at the client as a
+    single TCP segment, making the stream appear to batch or freeze."""
+
+    def setup(self) -> None:  # type: ignore[override]
+        super().setup()
+        try:
+            self.connection.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except (AttributeError, OSError):
+            pass
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -289,7 +304,8 @@ if __name__ == "__main__":
         RUNTIME_LOG_PATH,
     )
     try:
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True,
+                request_handler=_NagleDisabledRequestHandler)
     except Exception:
         logger.exception("Flask server failed to start")
         _write_bootstrap_failure("app.run")

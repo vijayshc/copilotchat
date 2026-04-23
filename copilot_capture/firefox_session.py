@@ -38,7 +38,6 @@ from .state import ConversationState
 
 
 SOCKET_CLOSE_DRAIN_SECONDS = 0.5
-POST_COMPLETION_GRACE_SECONDS = 0.15
 
 
 class FirefoxCopilotSession:
@@ -196,45 +195,41 @@ class FirefoxCopilotSession:
                 self.state.finalize_turn(turn)
 
     # ------------------------------------------------------------------ response collection
+    # Protocol: type:1 (writeAtCursor / messages+cursor) = incremental stream fragments.
+    #           type:2 (InvocationResult) = authoritative final answer AND completion signal.
+    #           socket_close = fallback end-of-turn if type:2 never arrives.
 
     async def _await_final_answer(self, turn: TurnContext, timeout: float) -> str:
+        """Non-stream path: accumulate type:1 deltas; return on type:2."""
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for AI response")
             event = await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
-            if event.kind == "assistant_final":
+
+            if event.kind == "assistant_final" and event.raw_type == 2:
+                # type:2 = authoritative complete answer; return immediately.
                 answer = self._current_answer(turn)
-                if event.raw_type == 2 and answer.strip():
-                    if self._looks_like_prompt_echo(turn, answer):
-                        raise TimeoutError("Copilot echoed the prompt without producing an assistant answer")
-                    return answer
-                continue
-            if event.kind in {"assistant_delta", "user_message"}:
-                continue
+                if not answer.strip():
+                    continue  # type:2 with no text is unusual; keep waiting
+                if self._looks_like_prompt_echo(turn, answer):
+                    raise TimeoutError("Copilot echoed the prompt without producing an assistant answer")
+                return answer
+
             if event.kind in {"completion", "socket_close"}:
-                # Drain any trailing events quickly
-                await self._drain_briefly(turn, deadline)
+                # Fallback: socket closed before type:2 — return whatever assembled text we have.
                 answer = self._current_answer(turn)
                 if answer.strip():
                     if self._looks_like_prompt_echo(turn, answer):
                         raise TimeoutError("Copilot echoed the prompt without producing an assistant answer")
                     return answer
-                raise TimeoutError("Copilot connection completed without a response body")
+                raise TimeoutError("Copilot connection closed without a response body")
 
-    async def _drain_briefly(self, turn: TurnContext, deadline: float) -> None:
-        drain_until = min(deadline, time.monotonic() + POST_COMPLETION_GRACE_SECONDS)
-        while True:
-            remaining = drain_until - time.monotonic()
-            if remaining <= 0:
-                return
-            try:
-                await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return
+            # assistant_delta (type:1), user_message, thinking — accumulate and keep waiting.
 
     async def _stream_turn(self, turn: TurnContext, timeout: float, emit: Callable[[str, Any], None]) -> None:
+        """Stream path: emit each type:1 delta immediately; type:2 = final + done."""
         deadline = time.monotonic() + timeout
         last_snapshot = ""
         while True:
@@ -242,42 +237,37 @@ class FirefoxCopilotSession:
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for streamed AI response")
             event = await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
-            if event.kind in {"assistant_delta", "assistant_final"}:
+
+            if event.kind == "assistant_delta":
+                # Emit the current assembled stream text immediately — every token.
                 snapshot = self._current_answer(turn) or event.content
                 last_snapshot = self._emit_snapshot(emit, snapshot, last_snapshot)
-                if event.kind == "assistant_final" and event.raw_type == 2:
-                    emit("done", None)
-                    return
-            elif event.kind in {"completion", "socket_close"}:
-                # Drain remaining events quickly, then finish
-                await self._drain_stream_tail(turn, deadline, emit, last_snapshot)
+                # Yield to the event loop so the GIL is released and the worker
+                # thread can drain this token from stream_queue and forward it to
+                # the HTTP layer before the next token is processed.  Without this,
+                # a fast burst of events is processed in a tight loop, all snapshots
+                # accumulate in stream_queue before the worker thread ever runs, and
+                # the client receives the full message in one chunk instead of token
+                # by token.
+                await asyncio.sleep(0)
+
+            elif event.kind == "assistant_final" and event.raw_type == 2:
+                # type:2 = authoritative final answer and completion signal.
+                # Emit the definitive text then close the stream.
+                final = self._current_answer(turn) or event.content
+                self._emit_snapshot(emit, final, last_snapshot)
                 emit("done", None)
                 return
-            # user_message, thinking events — skip
 
-    async def _drain_stream_tail(
-        self,
-        turn: TurnContext,
-        deadline: float,
-        emit: Callable[[str, Any], None],
-        last_snapshot: str,
-    ) -> None:
-        drain_until = min(deadline, time.monotonic() + POST_COMPLETION_GRACE_SECONDS)
-        while True:
-            remaining = drain_until - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                event = await asyncio.wait_for(turn.event_queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-            if event.kind in {"assistant_delta", "assistant_final"}:
-                snapshot = self._current_answer(turn) or event.content
-                last_snapshot = self._emit_snapshot(emit, snapshot, last_snapshot)
-        # Final snapshot
-        final = self._current_answer(turn)
-        if final and final != last_snapshot:
-            emit("snapshot", final)
+            elif event.kind in {"completion", "socket_close"}:
+                # Fallback: socket closed without type:2 — emit best available text.
+                final = self._current_answer(turn)
+                if final and final != last_snapshot:
+                    emit("snapshot", final)
+                emit("done", None)
+                return
+
+            # user_message, thinking, non-type:2 assistant_final — skip.
 
     @staticmethod
     def _current_answer(turn: TurnContext) -> str:

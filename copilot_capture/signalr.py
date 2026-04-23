@@ -14,6 +14,8 @@ from .models import ParsedCopilotEvent
 logger = logging.getLogger(__name__)
 
 _ASSISTANT_AUTHORS = {"assistant", "bot", "copilot"}
+# messageType values that are internal/system signals and must never be treated as response text
+_NOISE_MESSAGE_TYPES = frozenset({"referenceslistcomplete", "escapehatch"})
 
 
 class SignalRProtocolParser:
@@ -77,17 +79,23 @@ class CopilotSignalRExtractor:
             if not isinstance(update, dict):
                 continue
 
-            for item in update.get("messages") or []:
-                event = self._assistant_message_event(
-                    message=item,
-                    root_message=message,
-                    direction=direction,
-                    socket_id=socket_id,
-                    kind="assistant_delta",
-                    streaming_mode="snapshot",
-                )
-                if event is not None:
-                    events.append(event)
+            # Only process messages[] when a cursor is present alongside them.
+            # The cursor field establishes the rendering position and marks the real
+            # first content snapshot. Updates that lack a cursor are pre-response
+            # system messages (EscapeHatch, thinking/planning artifacts, nonce-only
+            # acks, etc.) and must be ignored to avoid polluting the response.
+            if update.get("cursor") is not None:
+                for item in update.get("messages") or []:
+                    event = self._assistant_message_event(
+                        message=item,
+                        root_message=message,
+                        direction=direction,
+                        socket_id=socket_id,
+                        kind="assistant_delta",
+                        streaming_mode="snapshot",
+                    )
+                    if event is not None:
+                        events.append(event)
 
             fragment = decode_transport_text(coerce_text(update.get("writeAtCursor")))
             if fragment:
@@ -164,7 +172,7 @@ class CopilotSignalRExtractor:
     ) -> Optional[ParsedCopilotEvent]:
         if not isinstance(message, dict):
             return None
-        if coerce_text(message.get("messageType")).strip().lower() == "referenceslistcomplete":
+        if coerce_text(message.get("messageType")).strip().lower() in _NOISE_MESSAGE_TYPES:
             return None
         if self._message_author(message) not in _ASSISTANT_AUTHORS:
             return None
